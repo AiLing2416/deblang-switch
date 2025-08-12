@@ -3,8 +3,9 @@
 # ==============================================================================
 # Script Name: change_locale.sh
 # Description: Changes the system locale on Debian-based systems with presets.
-# Author:      AI Assistant
-# Date:        2025-04-07
+#              (Memory-efficient version for low-resource systems)
+# Author:      Gemini
+# Date:        2025-08-12
 # Usage:       sudo bash change_locale.sh
 # Requires:    root privileges, standard Debian utilities (locale-gen, update-locale)
 # ==============================================================================
@@ -17,12 +18,19 @@ declare -A locales=(
     ["zh_CN.UTF-8"]="中国简体中文 (Simplified Chinese, China)"
 )
 locale_keys=("en_US.UTF-8" "zh_TW.UTF-8" "zh_CN.UTF-8")
+LOCALE_GEN_FILE="/etc/locale.gen"
+LOCALE_GEN_BACKUP="/etc/locale.gen.backup"
 
 # --- 函数定义 ---
 
 # 显示错误信息并退出
 error_exit() {
     echo "错误: $1" >&2
+    # 如果备份文件存在，则恢复
+    if [ -f "$LOCALE_GEN_BACKUP" ]; then
+        echo "正在从备份恢复 $LOCALE_GEN_FILE..."
+        mv "$LOCALE_GEN_BACKUP" "$LOCALE_GEN_FILE"
+    fi
     exit 1
 }
 
@@ -33,52 +41,51 @@ check_root() {
     fi
 }
 
-# 生成并更新 locale
+# 清理函数，用于退出时恢复备份
+cleanup() {
+    if [ -f "$LOCALE_GEN_BACKUP" ]; then
+        echo "操作完成，正在恢复原始的 $LOCALE_GEN_FILE 文件..."
+        mv "$LOCALE_GEN_BACKUP" "$LOCALE_GEN_FILE" || echo "警告: 恢复备份文件失败。"
+    fi
+}
+
+
+# 生成并更新 locale (内存优化版)
 set_locale() {
     local target_locale="$1"
     local description="${locales[$target_locale]}"
 
     echo "正在准备设置系统语言为: $description ($target_locale)..."
+    
+    # 设置 trap，确保脚本退出时（无论成功还是失败）都尝试恢复备份
+    trap cleanup EXIT
 
-    # 1. 确保目标 locale 在 /etc/locale.gen 文件中存在且未被注释
-    echo "检查 /etc/locale.gen 文件..."
-    # 检查是否存在对应的行，忽略前导空格和注释符
-    if ! grep -q "^\s*${target_locale}\s\+UTF-8" /etc/locale.gen; then
-        echo "警告: ${target_locale} 在 /etc/locale.gen 中未配置或被注释。正在尝试添加/启用..."
-        # 如果存在注释行，则取消注释
-        if grep -q "^\s*#\s*${target_locale}\s\+UTF-8" /etc/locale.gen; then
-            echo "找到已注释的行，正在取消注释..."
-            sed -i -E "s/^\s*#\s*(${target_locale}\s+UTF-8)/\1/" /etc/locale.gen || error_exit "修改 /etc/locale.gen 失败。"
-        else
-            # 如果完全不存在，则添加新行
-            echo "未找到相关行，正在添加新行..."
-            echo "${target_locale} UTF-8" >> /etc/locale.gen || error_exit "向 /etc/locale.gen 添加行失败。"
-        fi
+    # 1. 备份 /etc/locale.gen 文件
+    echo "正在备份 $LOCALE_GEN_FILE 到 $LOCALE_GEN_BACKUP..."
+    cp "$LOCALE_GEN_FILE" "$LOCALE_GEN_BACKUP" || error_exit "创建备份文件失败。"
+
+    # 2. 修改 /etc/locale.gen，仅保留目标 locale
+    echo "正在修改 $LOCALE_GEN_FILE 以仅启用 $target_locale..."
+    # 首先注释掉所有行
+    sed -i 's/^/# /' "$LOCALE_GEN_FILE"
+    # 然后找到目标 locale 并取消其注释
+    # 如果目标 locale 不存在，则添加到文件末尾
+    if grep -q "# ${target_locale}" "$LOCALE_GEN_FILE"; then
+        sed -i -E "s/^#\s*(${target_locale}\s+UTF-8)/\1/" "$LOCALE_GEN_FILE" || error_exit "在 $LOCALE_GEN_FILE 中启用目标 locale 失败。"
     else
-         # 如果存在且未注释，检查是否真的未注释
-         if grep -q "^\s*#\s*${target_locale}\s\+UTF-8" /etc/locale.gen; then
-            echo "找到已注释的行，正在取消注释..."
-            sed -i -E "s/^\s*#\s*(${target_locale}\s+UTF-8)/\1/" /etc/locale.gen || error_exit "修改 /etc/locale.gen 失败。"
-         else
-            echo "${target_locale} 已在 /etc/locale.gen 中启用。"
-         fi
+        echo "未在文件中找到 ${target_locale}，正在添加..."
+        echo "${target_locale} UTF-8" >> "$LOCALE_GEN_FILE" || error_exit "向 $LOCALE_GEN_FILE 添加新 locale 失败。"
     fi
-
-    # 2. 重新生成 locale 数据
-    echo "正在运行 locale-gen..."
-    if locale-gen "$target_locale"; then
+    
+    # 3. 重新生成 locale 数据
+    echo "正在运行 locale-gen (仅针对选定语言)..."
+    if locale-gen; then
         echo "locale-gen 执行成功。"
     else
-        # 如果指定locale生成失败，尝试生成所有
-        echo "警告：指定 locale 生成失败，尝试生成所有已启用的 locales..."
-        if locale-gen; then
-            echo "locale-gen (全部) 执行成功。"
-        else
-           error_exit "locale-gen 执行失败。请检查 /etc/locale.gen 文件配置和系统日志。"
-        fi
+        error_exit "locale-gen 执行失败。请检查系统日志。"
     fi
 
-    # 3. 更新系统默认 locale 设置
+    # 4. 更新系统默认 locale 设置
     echo "正在运行 update-locale 将 LANG 设置为 $target_locale..."
     if update-locale LANG="$target_locale"; then
         echo "update-locale 执行成功。"
