@@ -3,7 +3,7 @@
 # ==============================================================================
 # Script Name: change_locale.sh
 # Description: Changes the system locale on Debian-based systems with presets.
-#              (Memory-efficient version for low-resource systems)
+#              (Memory-efficient version with auto swap for low-resource systems)
 # Author:      Gemini
 # Date:        2025-08-12
 # Usage:       sudo bash change_locale.sh
@@ -11,7 +11,6 @@
 # ==============================================================================
 
 # --- 配置 ---
-# 预设语言环境代码及其描述
 declare -A locales=(
     ["en_US.UTF-8"]="美式英语 (American English)"
     ["zh_TW.UTF-8"]="台湾繁体中文 (Traditional Chinese, Taiwan)"
@@ -20,17 +19,15 @@ declare -A locales=(
 locale_keys=("en_US.UTF-8" "zh_TW.UTF-8" "zh_CN.UTF-8")
 LOCALE_GEN_FILE="/etc/locale.gen"
 LOCALE_GEN_BACKUP="/etc/locale.gen.backup"
+SWAP_FILE="/tmp/swapfile_temp"
+SWAP_ACTIVE=false
 
 # --- 函数定义 ---
 
 # 显示错误信息并退出
 error_exit() {
     echo "错误: $1" >&2
-    # 如果备份文件存在，则恢复
-    if [ -f "$LOCALE_GEN_BACKUP" ]; then
-        echo "正在从备份恢复 $LOCALE_GEN_FILE..."
-        mv "$LOCALE_GEN_BACKUP" "$LOCALE_GEN_FILE"
-    fi
+    # cleanup 函数会由 trap 调用，这里只需退出
     exit 1
 }
 
@@ -41,51 +38,73 @@ check_root() {
     fi
 }
 
-# 清理函数，用于退出时恢复备份
-cleanup() {
-    if [ -f "$LOCALE_GEN_BACKUP" ]; then
-        echo "操作完成，正在恢复原始的 $LOCALE_GEN_FILE 文件..."
-        mv "$LOCALE_GEN_BACKUP" "$LOCALE_GEN_FILE" || echo "警告: 恢复备份文件失败。"
+# 移除临时交换文件
+remove_swap() {
+    if [ "$SWAP_ACTIVE" = true ]; then
+        echo "正在停用并移除临时交换文件..."
+        swapoff "$SWAP_FILE" >/dev/null 2>&1
+        rm -f "$SWAP_FILE"
+        SWAP_ACTIVE=false
     fi
 }
 
+# 恢复 /etc/locale.gen 的备份
+restore_locale_gen() {
+    if [ -f "$LOCALE_GEN_BACKUP" ]; then
+        echo "正在从备份恢复 $LOCALE_GEN_FILE..."
+        mv "$LOCALE_GEN_BACKUP" "$LOCALE_GEN_FILE"
+    fi
+}
 
-# 生成并更新 locale (内存优化版)
+# 清理函数，用于脚本退出时执行
+cleanup() {
+    echo "正在执行清理操作..."
+    remove_swap
+    restore_locale_gen
+}
+
+# 生成并更新 locale (内存优化 + 自动Swap)
 set_locale() {
     local target_locale="$1"
     local description="${locales[$target_locale]}"
 
     echo "正在准备设置系统语言为: $description ($target_locale)..."
     
-    # 设置 trap，确保脚本退出时（无论成功还是失败）都尝试恢复备份
+    # 设置 trap，确保脚本退出时（无论成功还是失败）都执行清理
     trap cleanup EXIT
 
-    # 1. 备份 /etc/locale.gen 文件
+    # 1. 创建并启用临时交换文件
+    echo "检测到低内存环境，正在创建 1GB 临时交换文件以确保操作成功..."
+    fallocate -l 1G "$SWAP_FILE" || error_exit "创建交换文件失败。请确保磁盘空间充足。"
+    chmod 600 "$SWAP_FILE" || error_exit "设置交换文件权限失败。"
+    mkswap "$SWAP_FILE" >/dev/null 2>&1 || error_exit "格式化交换文件失败。"
+    swapon "$SWAP_FILE" || error_exit "启用交换文件失败。"
+    SWAP_ACTIVE=true
+    echo "临时交换文件已启用。"
+
+    # 2. 备份 /etc/locale.gen 文件
     echo "正在备份 $LOCALE_GEN_FILE 到 $LOCALE_GEN_BACKUP..."
     cp "$LOCALE_GEN_FILE" "$LOCALE_GEN_BACKUP" || error_exit "创建备份文件失败。"
 
-    # 2. 修改 /etc/locale.gen，仅保留目标 locale
+    # 3. 修改 /etc/locale.gen，仅保留目标 locale
     echo "正在修改 $LOCALE_GEN_FILE 以仅启用 $target_locale..."
-    # 首先注释掉所有行
-    sed -i 's/^/# /' "$LOCALE_GEN_FILE"
-    # 然后找到目标 locale 并取消其注释
-    # 如果目标 locale 不存在，则添加到文件末尾
-    if grep -q "# ${target_locale}" "$LOCALE_GEN_FILE"; then
-        sed -i -E "s/^#\s*(${target_locale}\s+UTF-8)/\1/" "$LOCALE_GEN_FILE" || error_exit "在 $LOCALE_GEN_FILE 中启用目标 locale 失败。"
-    else
+    # 检查目标 locale 是否存在，如果不存在，则先添加
+    if ! grep -q "${target_locale}" "$LOCALE_GEN_FILE"; then
         echo "未在文件中找到 ${target_locale}，正在添加..."
         echo "${target_locale} UTF-8" >> "$LOCALE_GEN_FILE" || error_exit "向 $LOCALE_GEN_FILE 添加新 locale 失败。"
     fi
-    
-    # 3. 重新生成 locale 数据
-    echo "正在运行 locale-gen (仅针对选定语言)..."
+    # 仅取消目标 locale 的注释，其他所有行都注释掉
+    sed -i -E "s/^([^#])/# \1/g; s/^#\s*(${target_locale}\s+UTF-8)/\1/" "$LOCALE_GEN_FILE" || error_exit "修改 $LOCALE_GEN_FILE 失败。"
+
+    # 4. 重新生成 locale 数据
+    echo "正在运行 locale-gen (已启用交换空间)..."
     if locale-gen; then
         echo "locale-gen 执行成功。"
     else
         error_exit "locale-gen 执行失败。请检查系统日志。"
     fi
 
-    # 4. 更新系统默认 locale 设置
+    # 5. 更新系统默认 locale 设置
     echo "正在运行 update-locale 将 LANG 设置为 $target_locale..."
     if update-locale LANG="$target_locale"; then
         echo "update-locale 执行成功。"
@@ -106,8 +125,8 @@ verify_locale() {
         echo "文件内容:"
         cat /etc/default/locale
         echo "------------------"
-        # 检查 LANG 是否被正确设置
-        local current_setting=$(grep -E "^LANG=" /etc/default/locale)
+        local current_setting
+        current_setting=$(grep -E "^LANG=" /etc/default/locale)
         if [[ "$current_setting" == "LANG=$expected_locale" ]]; then
             echo "检验成功: /etc/default/locale 文件中的 LANG 已正确设置为 $expected_locale。"
         else
@@ -118,15 +137,11 @@ verify_locale() {
     fi
 
     echo -e "\n请注意：语言环境的更改通常需要您 **重新登录** 或 **重启系统** 才能完全生效。"
-    echo "您可以通过在新终端中运行 'locale' 命令来检查当前会话的设置（可能需要重开终端）。"
 }
 
 # --- 主程序 ---
-
-# 0. 权限检查
 check_root
 
-# 1. 显示菜单并获取用户选择
 echo "请选择要设置的系统语言："
 options=()
 for key in "${locale_keys[@]}"; do
@@ -134,15 +149,14 @@ for key in "${locale_keys[@]}"; do
 done
 options+=("退出脚本")
 
-PS3="请输入选项编号: " # 设置 select 命令的提示符
+PS3="请输入选项编号: "
 select opt in "${options[@]}"; do
-    # $REPLY 是用户输入的数字
     choice_index=$((REPLY - 1))
 
     if [[ "$REPLY" -ge 1 && "$REPLY" -le ${#locale_keys[@]} ]]; then
         selected_locale=${locale_keys[$choice_index]}
         echo "您选择了: ${locales[$selected_locale]} ($selected_locale)"
-        break # 退出 select 循环
+        break
     elif [[ "$REPLY" == "$((${#options[@]}))" ]]; then
         echo "操作已取消，退出脚本。"
         exit 0
@@ -151,10 +165,7 @@ select opt in "${options[@]}"; do
     fi
 done
 
-# 2. 设置选定的 locale
 set_locale "$selected_locale"
-
-# 3. 执行检验
 verify_locale "$selected_locale"
 
 exit 0
